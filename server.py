@@ -2,7 +2,8 @@ import os
 import io
 import httpx
 from PIL import Image as PILImage
-from fastmcp import FastMCP, Image
+from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 
 mcp = FastMCP("Image Viewer")
 
