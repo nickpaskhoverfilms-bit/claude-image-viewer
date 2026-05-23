@@ -338,10 +338,14 @@ BOARD_HTML = """<!doctype html>
   .card { position: absolute; background: var(--panel);
     border: 1px solid var(--panel-border); border-radius: 8px;
     overflow: hidden; display: flex; flex-direction: column;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    cursor: grab; user-select: none; }
+  .card.dragging { cursor: grabbing; z-index: 50;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.6); }
   .card .thumb { flex: 1; background: #111216; display: flex;
     align-items: center; justify-content: center; overflow: hidden; }
-  .card .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .card .thumb img { width: 100%; height: 100%; object-fit: cover;
+    display: block; pointer-events: none; }
   .card .thumb .placeholder { color: var(--muted); font-size: 11px;
     text-transform: uppercase; letter-spacing: 0.08em; }
   .card .meta { padding: 8px 10px; display: flex; align-items: center;
@@ -354,8 +358,46 @@ BOARD_HTML = """<!doctype html>
   .status.in_progress { background: var(--in_progress); }
   .status.review { background: var(--review); }
   .status.locked { background: var(--locked); }
+  .dl-btn { color: var(--muted); text-decoration: none; font-size: 14px;
+    padding: 2px 7px; border-radius: 4px; line-height: 1; cursor: pointer;
+    border: 1px solid var(--panel-border); background: #1d1e24; }
+  .dl-btn:hover { color: var(--text); background: #2a2b33; }
   .empty { position: absolute; top: 40%; left: 50%; transform: translateX(-50%);
     color: var(--muted); font-size: 13px; }
+
+  #modal.hidden { display: none; }
+  #modal { position: fixed; inset: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: center; }
+  .modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.6); }
+  .modal-panel { position: relative; background: var(--panel);
+    border: 1px solid var(--panel-border); border-radius: 10px;
+    width: 440px; max-width: calc(100vw - 32px); padding: 20px;
+    display: flex; flex-direction: column; gap: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.6); }
+  .modal-panel h2 { margin: 0; font-size: 13px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .field { display: flex; flex-direction: column; gap: 4px;
+    font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.05em; }
+  .field input, .field select, .field textarea {
+    background: #15161a; color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 8px 10px; font-size: 13px; font-family: inherit;
+    text-transform: none; letter-spacing: normal; }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    outline: none; border-color: var(--review); }
+  .field textarea { resize: vertical; min-height: 90px; }
+  .modal-actions { display: flex; justify-content: flex-end;
+    gap: 8px; margin-top: 4px; }
+  .modal-actions button { background: #2a2b33; color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 8px 16px; font-size: 12px; cursor: pointer;
+    font-family: inherit; }
+  .modal-actions button:hover { background: #34353d; }
+  .modal-actions button.primary { background: var(--review);
+    border-color: var(--review); }
+  .modal-actions button.primary:hover { filter: brightness(1.1); }
+  .modal-error { color: #f87171; font-size: 12px; min-height: 16px; }
 </style>
 </head>
 <body>
@@ -364,10 +406,50 @@ BOARD_HTML = """<!doctype html>
   <span class="meta" id="meta">loading…</span>
 </header>
 <div id="board"><div class="empty" id="empty">loading…</div></div>
+
+<div id="modal" class="hidden">
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal-panel">
+    <h2 id="ed-heading">Edit card</h2>
+    <label class="field">Title
+      <input id="ed-title" type="text" autocomplete="off">
+    </label>
+    <label class="field">Status
+      <select id="ed-status">
+        <option value="in_progress">in progress</option>
+        <option value="review">review</option>
+        <option value="locked">locked</option>
+      </select>
+    </label>
+    <label class="field">Notes
+      <textarea id="ed-notes" rows="5"></textarea>
+    </label>
+    <div class="modal-error" id="ed-error"></div>
+    <div class="modal-actions">
+      <button id="ed-cancel" data-close="1">Cancel</button>
+      <button id="ed-save" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
   const board = document.getElementById('board');
   const meta = document.getElementById('meta');
+  const modal = document.getElementById('modal');
+  const edHeading = document.getElementById('ed-heading');
+  const edTitle = document.getElementById('ed-title');
+  const edStatus = document.getElementById('ed-status');
+  const edNotes = document.getElementById('ed-notes');
+  const edError = document.getElementById('ed-error');
+  const edSave = document.getElementById('ed-save');
   const PAD = 40;
+  const DRAG_THRESHOLD = 4;
+  let dragging = null;
+  let editing = null;
+
+  function safeFilename(s) {
+    return (s || 'image').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'image';
+  }
 
   function render(cards) {
     board.innerHTML = '';
@@ -382,6 +464,7 @@ BOARD_HTML = """<!doctype html>
     for (const c of cards) {
       const el = document.createElement('div');
       el.className = 'card';
+      el.dataset.cardId = c.id;
       el.style.left = c.x + 'px';
       el.style.top = c.y + 'px';
       el.style.width = c.width + 'px';
@@ -413,8 +496,21 @@ BOARD_HTML = """<!doctype html>
       s.textContent = c.status.replace('_', ' ');
       m.appendChild(t);
       m.appendChild(s);
+
+      if (c.full_image_url) {
+        const dl = document.createElement('a');
+        dl.className = 'dl-btn';
+        dl.href = c.full_image_url;
+        dl.download = safeFilename(c.title || ('card_' + c.id)) + '.jpg';
+        dl.title = 'Download full image';
+        dl.textContent = '↓';
+        dl.addEventListener('mousedown', (e) => e.stopPropagation());
+        dl.addEventListener('click', (e) => e.stopPropagation());
+        m.appendChild(dl);
+      }
       el.appendChild(m);
 
+      el.addEventListener('mousedown', (e) => startDrag(e, c, el));
       board.appendChild(el);
       maxX = Math.max(maxX, c.x + c.width);
       maxY = Math.max(maxY, c.y + c.height);
@@ -423,7 +519,114 @@ BOARD_HTML = """<!doctype html>
     board.style.minHeight = (maxY + PAD) + 'px';
   }
 
+  function startDrag(e, card, el) {
+    if (e.button !== 0) return;
+    dragging = {
+      card, el,
+      startX: card.x, startY: card.y,
+      mouseStartX: e.clientX, mouseStartY: e.clientY,
+      moved: false,
+      target: e.target,
+    };
+    e.preventDefault();
+  }
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - dragging.mouseStartX;
+    const dy = e.clientY - dragging.mouseStartY;
+    if (!dragging.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
+      dragging.moved = true;
+      dragging.el.classList.add('dragging');
+    }
+    if (dragging.moved) {
+      const nx = Math.max(0, dragging.startX + dx);
+      const ny = Math.max(0, dragging.startY + dy);
+      dragging.el.style.left = nx + 'px';
+      dragging.el.style.top = ny + 'px';
+      dragging.card.x = nx;
+      dragging.card.y = ny;
+    }
+  });
+
+  document.addEventListener('mouseup', async (e) => {
+    if (!dragging) return;
+    const d = dragging;
+    dragging = null;
+    d.el.classList.remove('dragging');
+    if (d.moved) {
+      try {
+        await fetch('/api/cards/' + d.card.id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x: d.card.x, y: d.card.y }),
+        });
+      } catch (err) {
+        meta.textContent = 'save failed: ' + err.message;
+      }
+      refresh();
+    } else {
+      // No drag → it's a click.
+      if (d.target.closest('.thumb') && d.card.full_image_url) {
+        window.open(d.card.full_image_url, '_blank', 'noopener');
+      } else {
+        openEditor(d.card);
+      }
+    }
+  });
+
+  function openEditor(card) {
+    editing = { id: card.id };
+    edHeading.textContent = 'Edit card · ' + (card.title || ('#' + card.id));
+    edTitle.value = card.title || '';
+    edStatus.value = card.status;
+    edNotes.value = card.notes || '';
+    edError.textContent = '';
+    modal.classList.remove('hidden');
+    setTimeout(() => { edTitle.focus(); edTitle.select(); }, 0);
+  }
+
+  function closeEditor() {
+    editing = null;
+    modal.classList.add('hidden');
+    refresh();
+  }
+
+  modal.addEventListener('click', (e) => {
+    if (e.target.dataset && e.target.dataset.close) closeEditor();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && editing) closeEditor();
+  });
+
+  edSave.addEventListener('click', async () => {
+    if (!editing) return;
+    edSave.disabled = true;
+    edError.textContent = '';
+    try {
+      const r = await fetch('/api/cards/' + editing.id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: edTitle.value,
+          status: edStatus.value,
+          notes: edNotes.value,
+        }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || ('HTTP ' + r.status));
+      }
+      closeEditor();
+    } catch (err) {
+      edError.textContent = 'save failed: ' + err.message;
+    } finally {
+      edSave.disabled = false;
+    }
+  });
+
   async function refresh() {
+    if (dragging || editing) return;
     try {
       const r = await fetch('/api/cards', { cache: 'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -464,6 +667,42 @@ async def api_cards(request: Request) -> JSONResponse:
     return JSONResponse(
         {"project_id": project_id, "cards": [_card_to_dict(r) for r in rows]}
     )
+
+
+_PATCHABLE = ("title", "status", "notes", "x", "y")
+
+
+@mcp.custom_route("/api/cards/{card_id:int}", methods=["PATCH"])
+async def api_patch_card(request: Request) -> JSONResponse:
+    card_id = request.path_params["card_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    fields = {k: body[k] for k in _PATCHABLE if k in body}
+    if "status" in fields and fields["status"] not in ALLOWED_STATUSES:
+        return JSONResponse(
+            {"error": f"status must be one of {sorted(ALLOWED_STATUSES)}"},
+            status_code=400,
+        )
+    if not fields:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+    sets = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
+    params = list(fields.values()) + [_now(), card_id]
+    with _db() as c:
+        c.execute(
+            f"UPDATE card SET {sets} WHERE id = ? AND deleted_at IS NULL",
+            params,
+        )
+        row = c.execute(
+            "SELECT * FROM card WHERE id = ? AND deleted_at IS NULL",
+            (card_id,),
+        ).fetchone()
+    if not row:
+        return JSONResponse({"error": "card not found"}, status_code=404)
+    return JSONResponse(_card_to_dict(row))
 
 
 def _serve_from(directory: Path, filename: str):
