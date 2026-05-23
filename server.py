@@ -114,18 +114,46 @@ def _card_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
-def _auto_place(project_id: int) -> tuple[float, float]:
-    with _db() as c:
-        count = c.execute(
-            "SELECT COUNT(*) AS n FROM card "
-            "WHERE project_id = ? AND deleted_at IS NULL",
-            (project_id,),
-        ).fetchone()["n"]
+def _auto_place(
+    project_id: int, w: float = 220.0, h: float = 260.0
+) -> tuple[float, float]:
+    """Pick the first grid slot that doesn't overlap any existing card.
+
+    Walks left-to-right, top-to-bottom on a 240x280 grid. Tested against
+    the actual bounding boxes of active cards, so cards previously
+    dragged out of the grid don't free up slots that they still occupy
+    on screen, and soft-deletes don't cause collisions either.
+    """
     col_w, row_h, margin = 240.0, 280.0, 20.0
     cols_per_row = 8
-    col = count % cols_per_row
-    row = count // cols_per_row
-    return margin + col * col_w, margin + row * row_h
+    with _db() as c:
+        rows = c.execute(
+            "SELECT x, y, width, height FROM card "
+            "WHERE project_id = ? AND deleted_at IS NULL",
+            (project_id,),
+        ).fetchall()
+    boxes = [
+        (r["x"], r["y"], r["x"] + r["width"], r["y"] + r["height"])
+        for r in rows
+    ]
+
+    def overlaps(x: float, y: float) -> bool:
+        x2, y2 = x + w, y + h
+        for bx1, by1, bx2, by2 in boxes:
+            if not (x2 <= bx1 or x >= bx2 or y2 <= by1 or y >= by2):
+                return True
+        return False
+
+    for i in range(10000):
+        col = i % cols_per_row
+        row = i // cols_per_row
+        x = margin + col * col_w
+        y = margin + row * row_h
+        if not overlaps(x, y):
+            return x, y
+    # Pathological fallback: just drop it below everything.
+    max_y = max((b[3] for b in boxes), default=margin)
+    return margin, max_y + 20.0
 
 
 def _download_and_store(card_id: int, source_url: str) -> tuple[str, str]:
@@ -325,6 +353,8 @@ BOARD_HTML = """<!doctype html>
     --in_progress: #d97706;
     --review: #2563eb;
     --locked: #16a34a;
+    --grid-dot: #2a2b33;
+    --lineage: rgba(180,180,200,0.55);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
@@ -334,14 +364,25 @@ BOARD_HTML = """<!doctype html>
     display: flex; align-items: center; gap: 12px; }
   header h1 { font-size: 14px; font-weight: 600; margin: 0; }
   header .meta { font-size: 12px; color: var(--muted); }
-  #board { position: relative; width: 100%; min-height: calc(100vh - 44px); }
+  #board { position: relative; width: 100%; min-height: calc(100vh - 44px);
+    background-image: radial-gradient(circle, var(--grid-dot) 1px, transparent 1px);
+    background-size: 24px 24px; background-position: 0 0; }
+  #board-svg { position: absolute; top: 0; left: 0; pointer-events: none;
+    overflow: visible; }
   .card { position: absolute; background: var(--panel);
     border: 1px solid var(--panel-border); border-radius: 8px;
     overflow: hidden; display: flex; flex-direction: column;
     box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-    cursor: grab; user-select: none; }
+    cursor: grab; user-select: none;
+    transition: box-shadow 120ms ease, transform 120ms ease; }
+  .card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+    width: 3px; background: var(--kind-color, transparent);
+    border-top-left-radius: 8px; border-bottom-left-radius: 8px; }
+  .card:hover { transform: translateY(-1px);
+    box-shadow: 0 6px 14px rgba(0,0,0,0.55); }
   .card.dragging { cursor: grabbing; z-index: 50;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.6); }
+    box-shadow: 0 14px 32px rgba(0,0,0,0.65);
+    transform: none; transition: none; }
   .card .thumb { flex: 1; background: #111216; display: flex;
     align-items: center; justify-content: center; overflow: hidden; }
   .card .thumb img { width: 100%; height: 100%; object-fit: cover;
@@ -349,9 +390,13 @@ BOARD_HTML = """<!doctype html>
   .card .thumb .placeholder { color: var(--muted); font-size: 11px;
     text-transform: uppercase; letter-spacing: 0.08em; }
   .card .meta { padding: 8px 10px; display: flex; align-items: center;
-    gap: 8px; border-top: 1px solid var(--panel-border); min-height: 36px; }
+    gap: 6px; border-top: 1px solid var(--panel-border); min-height: 36px; }
   .card .title { flex: 1; font-size: 12px; line-height: 1.3; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
+  .card .kind { font-size: 9px; padding: 2px 6px; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    background: #1d1e24; border: 1px solid var(--panel-border);
+    white-space: nowrap; }
   .card .status { font-size: 10px; padding: 2px 6px; border-radius: 999px;
     text-transform: uppercase; letter-spacing: 0.05em; color: white;
     white-space: nowrap; }
@@ -362,9 +407,13 @@ BOARD_HTML = """<!doctype html>
     padding: 2px 7px; border-radius: 4px; line-height: 1; cursor: pointer;
     border: 1px solid var(--panel-border); background: #1d1e24; }
   .dl-btn:hover { color: var(--text); background: #2a2b33; }
-  .empty { position: absolute; top: 40%; left: 50%; transform: translateX(-50%);
-    color: var(--muted); font-size: 13px; }
+  .empty { position: absolute; top: 40%; left: 50%;
+    transform: translate(-50%, -50%); color: var(--muted);
+    font-size: 13px; text-align: center; line-height: 1.6; }
+  .empty .small { display: block; font-size: 11px; margin-top: 4px;
+    color: #6b6c75; }
 
+  /* Edit modal */
   #modal.hidden { display: none; }
   #modal { position: fixed; inset: 0; z-index: 100;
     display: flex; align-items: center; justify-content: center; }
@@ -398,6 +447,20 @@ BOARD_HTML = """<!doctype html>
     border-color: var(--review); }
   .modal-actions button.primary:hover { filter: brightness(1.1); }
   .modal-error { color: #f87171; font-size: 12px; min-height: 16px; }
+
+  /* Lightbox */
+  #lightbox.hidden { display: none; }
+  #lightbox { position: fixed; inset: 0; z-index: 150;
+    display: flex; align-items: center; justify-content: center; }
+  .lb-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.88);
+    cursor: zoom-out; }
+  #lb-img { position: relative; max-width: 92vw; max-height: 92vh;
+    object-fit: contain; box-shadow: 0 30px 80px rgba(0,0,0,0.8);
+    border-radius: 4px; }
+  #lb-hint { position: absolute; bottom: 16px; left: 50%;
+    transform: translateX(-50%); color: var(--muted); font-size: 11px;
+    letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.7;
+    pointer-events: none; }
 </style>
 </head>
 <body>
@@ -432,6 +495,12 @@ BOARD_HTML = """<!doctype html>
   </div>
 </div>
 
+<div id="lightbox" class="hidden">
+  <div class="lb-backdrop" data-close="1"></div>
+  <img id="lb-img" alt="">
+  <div id="lb-hint">click backdrop or press Esc to close</div>
+</div>
+
 <script>
   const board = document.getElementById('board');
   const meta = document.getElementById('meta');
@@ -442,13 +511,61 @@ BOARD_HTML = """<!doctype html>
   const edNotes = document.getElementById('ed-notes');
   const edError = document.getElementById('ed-error');
   const edSave = document.getElementById('ed-save');
+  const lightbox = document.getElementById('lightbox');
+  const lbImg = document.getElementById('lb-img');
+  const SVG_NS = 'http://www.w3.org/2000/svg';
   const PAD = 40;
+  const SECTION_PAD = 18;
   const DRAG_THRESHOLD = 4;
+  const KIND_COLORS = {
+    reference: '#6b7280',
+    generation: '#a855f7',
+    anchor: '#06b6d4',
+    video: '#ec4899',
+    deliverable: '#22c55e',
+    note: '#eab308',
+  };
+  const SECTION_COLORS = [
+    '#4f46e5', '#0891b2', '#16a34a',
+    '#d97706', '#db2777', '#7c3aed',
+  ];
   let dragging = null;
   let editing = null;
+  let viewing = null;
 
   function safeFilename(s) {
     return (s || 'image').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'image';
+  }
+
+  function svgEl(tag, attrs) {
+    const el = document.createElementNS(SVG_NS, tag);
+    if (attrs) for (const k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+
+  function sectionColor(name) {
+    let h = 0;
+    for (let i = 0; i < name.length; i++) {
+      h = ((h * 31) + name.charCodeAt(i)) | 0;
+    }
+    return SECTION_COLORS[Math.abs(h) % SECTION_COLORS.length];
+  }
+
+  // Point on `rect`'s perimeter along the line from rect's center toward
+  // (fromX, fromY). Used to terminate lineage lines at card edges so the
+  // arrowhead is visible just outside the child card.
+  function edgePoint(rect, fromX, fromY) {
+    const cx = rect.x + rect.w / 2;
+    const cy = rect.y + rect.h / 2;
+    const dx = fromX - cx;
+    const dy = fromY - cy;
+    if (dx === 0 && dy === 0) return { x: cx, y: cy };
+    const halfW = rect.w / 2;
+    const halfH = rect.h / 2;
+    const sx = dx !== 0 ? halfW / Math.abs(dx) : Infinity;
+    const sy = dy !== 0 ? halfH / Math.abs(dy) : Infinity;
+    const s = Math.min(sx, sy);
+    return { x: cx + dx * s, y: cy + dy * s };
   }
 
   function render(cards) {
@@ -456,11 +573,105 @@ BOARD_HTML = """<!doctype html>
     if (!cards.length) {
       const e = document.createElement('div');
       e.className = 'empty';
-      e.textContent = 'no cards yet — add one with the MCP add_card tool';
+      e.innerHTML = 'no cards yet' +
+        '<span class="small">add one with the MCP add_card tool</span>';
       board.appendChild(e);
       return;
     }
+
     let maxX = 0, maxY = 0;
+    for (const c of cards) {
+      maxX = Math.max(maxX, c.x + c.width);
+      maxY = Math.max(maxY, c.y + c.height);
+    }
+    const boardW = maxX + PAD;
+    const boardH = maxY + PAD;
+    board.style.minWidth = boardW + 'px';
+    board.style.minHeight = boardH + 'px';
+
+    // SVG overlay sits behind the cards. Sections first (lowest), then
+    // lineage lines, then the cards themselves get appended on top.
+    const svg = svgEl('svg', {
+      id: 'board-svg',
+      width: boardW, height: boardH,
+      viewBox: '0 0 ' + boardW + ' ' + boardH,
+    });
+
+    const defs = svgEl('defs');
+    const marker = svgEl('marker', {
+      id: 'lin-arrow',
+      viewBox: '0 0 10 10', refX: '8', refY: '5',
+      markerWidth: '8', markerHeight: '8', orient: 'auto',
+    });
+    marker.appendChild(svgEl('path', {
+      d: 'M0,0 L10,5 L0,10 z', fill: 'rgba(180,180,200,0.7)',
+    }));
+    defs.appendChild(marker);
+    svg.appendChild(defs);
+
+    // Sections: group active cards by non-empty section, draw a soft
+    // tinted rounded rect that just visualizes where those cards happen
+    // to be — it doesn't constrain anything.
+    const sectionGroup = svgEl('g', { class: 'sections' });
+    const bySection = new Map();
+    for (const c of cards) {
+      if (!c.section) continue;
+      if (!bySection.has(c.section)) bySection.set(c.section, []);
+      bySection.get(c.section).push(c);
+    }
+    for (const [name, members] of bySection) {
+      let nx = Infinity, ny = Infinity, fx = 0, fy = 0;
+      for (const c of members) {
+        nx = Math.min(nx, c.x);
+        ny = Math.min(ny, c.y);
+        fx = Math.max(fx, c.x + c.width);
+        fy = Math.max(fy, c.y + c.height);
+      }
+      const x = nx - SECTION_PAD;
+      const y = ny - SECTION_PAD;
+      const w = (fx - nx) + SECTION_PAD * 2;
+      const h = (fy - ny) + SECTION_PAD * 2;
+      const color = sectionColor(name);
+      sectionGroup.appendChild(svgEl('rect', {
+        x: x, y: y, width: w, height: h, rx: '12', ry: '12',
+        fill: color, 'fill-opacity': '0.10',
+        stroke: color, 'stroke-opacity': '0.35', 'stroke-width': '1',
+      }));
+      const label = svgEl('text', {
+        x: x + 12, y: y + 18,
+        fill: color, 'fill-opacity': '0.85',
+        'font-size': '10', 'font-family': '-apple-system, sans-serif',
+        'font-weight': '600', 'letter-spacing': '1.2',
+      });
+      label.textContent = name.toUpperCase();
+      sectionGroup.appendChild(label);
+    }
+    svg.appendChild(sectionGroup);
+
+    // Lineage lines: parent → child arrows, terminated at each card's
+    // edge so the arrowhead lives in the gap between them.
+    const cardById = new Map(cards.map((c) => [c.id, c]));
+    const lineGroup = svgEl('g', { class: 'lines' });
+    for (const child of cards) {
+      if (!child.parent_card_id) continue;
+      const parent = cardById.get(child.parent_card_id);
+      if (!parent || parent.id === child.id) continue;
+      const pRect = { x: parent.x, y: parent.y, w: parent.width, h: parent.height };
+      const cRect = { x: child.x,  y: child.y,  w: child.width,  h: child.height };
+      const pCx = pRect.x + pRect.w / 2, pCy = pRect.y + pRect.h / 2;
+      const cCx = cRect.x + cRect.w / 2, cCy = cRect.y + cRect.h / 2;
+      const start = edgePoint(pRect, cCx, cCy);
+      const end = edgePoint(cRect, pCx, pCy);
+      lineGroup.appendChild(svgEl('line', {
+        x1: start.x, y1: start.y, x2: end.x, y2: end.y,
+        stroke: 'var(--lineage)', 'stroke-width': '1.5',
+        'stroke-linecap': 'round', 'marker-end': 'url(#lin-arrow)',
+      }));
+    }
+    svg.appendChild(lineGroup);
+    board.appendChild(svg);
+
+    // Cards on top.
     for (const c of cards) {
       const el = document.createElement('div');
       el.className = 'card';
@@ -469,6 +680,8 @@ BOARD_HTML = """<!doctype html>
       el.style.top = c.y + 'px';
       el.style.width = c.width + 'px';
       el.style.height = c.height + 'px';
+      el.style.setProperty('--kind-color',
+        KIND_COLORS[c.kind] || 'transparent');
 
       const thumb = document.createElement('div');
       thumb.className = 'thumb';
@@ -491,10 +704,14 @@ BOARD_HTML = """<!doctype html>
       t.className = 'title';
       t.textContent = c.title || ('card ' + c.id);
       t.title = c.title || '';
+      const k = document.createElement('div');
+      k.className = 'kind';
+      k.textContent = c.kind;
       const s = document.createElement('div');
       s.className = 'status ' + c.status;
       s.textContent = c.status.replace('_', ' ');
       m.appendChild(t);
+      m.appendChild(k);
       m.appendChild(s);
 
       if (c.full_image_url) {
@@ -512,11 +729,7 @@ BOARD_HTML = """<!doctype html>
 
       el.addEventListener('mousedown', (e) => startDrag(e, c, el));
       board.appendChild(el);
-      maxX = Math.max(maxX, c.x + c.width);
-      maxY = Math.max(maxY, c.y + c.height);
     }
-    board.style.minWidth = (maxX + PAD) + 'px';
-    board.style.minHeight = (maxY + PAD) + 'px';
   }
 
   function startDrag(e, card, el) {
@@ -566,9 +779,8 @@ BOARD_HTML = """<!doctype html>
       }
       refresh();
     } else {
-      // No drag → it's a click.
       if (d.target.closest('.thumb') && d.card.full_image_url) {
-        window.open(d.card.full_image_url, '_blank', 'noopener');
+        openLightbox(d.card.full_image_url, d.card.title);
       } else {
         openEditor(d.card);
       }
@@ -592,11 +804,30 @@ BOARD_HTML = """<!doctype html>
     refresh();
   }
 
+  function openLightbox(url, title) {
+    viewing = url;
+    lbImg.src = url;
+    lbImg.alt = title || '';
+    lightbox.classList.remove('hidden');
+  }
+
+  function closeLightbox() {
+    viewing = null;
+    lightbox.classList.add('hidden');
+    lbImg.removeAttribute('src');
+    refresh();
+  }
+
   modal.addEventListener('click', (e) => {
     if (e.target.dataset && e.target.dataset.close) closeEditor();
   });
+  lightbox.addEventListener('click', (e) => {
+    if (e.target.dataset && e.target.dataset.close) closeLightbox();
+  });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && editing) closeEditor();
+    if (e.key !== 'Escape') return;
+    if (viewing) closeLightbox();
+    else if (editing) closeEditor();
   });
 
   edSave.addEventListener('click', async () => {
@@ -626,7 +857,7 @@ BOARD_HTML = """<!doctype html>
   });
 
   async function refresh() {
-    if (dragging || editing) return;
+    if (dragging || editing || viewing) return;
     try {
       const r = await fetch('/api/cards', { cache: 'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
