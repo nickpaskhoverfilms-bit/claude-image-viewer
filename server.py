@@ -11,6 +11,13 @@ import httpx
 from PIL import Image as PILImage
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
+from starlette.requests import Request
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+)
 
 
 # Railway mounts a persistent volume at /data. Locally that directory does
@@ -301,6 +308,185 @@ def delete_card(card_id: int) -> str:
             (now, now, card_id),
         )
     return json.dumps({"card_id": card_id, "deleted": True})
+
+
+BOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Canvas Board</title>
+<style>
+  :root {
+    --bg: #1a1a1f;
+    --panel: #24252c;
+    --panel-border: #34353d;
+    --text: #e8e8ea;
+    --muted: #9a9ba3;
+    --in_progress: #d97706;
+    --review: #2563eb;
+    --locked: #16a34a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 10; padding: 10px 16px;
+    background: rgba(26,26,31,0.92); border-bottom: 1px solid var(--panel-border);
+    display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header .meta { font-size: 12px; color: var(--muted); }
+  #board { position: relative; width: 100%; min-height: calc(100vh - 44px); }
+  .card { position: absolute; background: var(--panel);
+    border: 1px solid var(--panel-border); border-radius: 8px;
+    overflow: hidden; display: flex; flex-direction: column;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+  .card .thumb { flex: 1; background: #111216; display: flex;
+    align-items: center; justify-content: center; overflow: hidden; }
+  .card .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .card .thumb .placeholder { color: var(--muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.08em; }
+  .card .meta { padding: 8px 10px; display: flex; align-items: center;
+    gap: 8px; border-top: 1px solid var(--panel-border); min-height: 36px; }
+  .card .title { flex: 1; font-size: 12px; line-height: 1.3; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .card .status { font-size: 10px; padding: 2px 6px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: 0.05em; color: white;
+    white-space: nowrap; }
+  .status.in_progress { background: var(--in_progress); }
+  .status.review { background: var(--review); }
+  .status.locked { background: var(--locked); }
+  .empty { position: absolute; top: 40%; left: 50%; transform: translateX(-50%);
+    color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Canvas Board</h1>
+  <span class="meta" id="meta">loading…</span>
+</header>
+<div id="board"><div class="empty" id="empty">loading…</div></div>
+<script>
+  const board = document.getElementById('board');
+  const meta = document.getElementById('meta');
+  const PAD = 40;
+
+  function render(cards) {
+    board.innerHTML = '';
+    if (!cards.length) {
+      const e = document.createElement('div');
+      e.className = 'empty';
+      e.textContent = 'no cards yet — add one with the MCP add_card tool';
+      board.appendChild(e);
+      return;
+    }
+    let maxX = 0, maxY = 0;
+    for (const c of cards) {
+      const el = document.createElement('div');
+      el.className = 'card';
+      el.style.left = c.x + 'px';
+      el.style.top = c.y + 'px';
+      el.style.width = c.width + 'px';
+      el.style.height = c.height + 'px';
+
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      if (c.thumbnail_url) {
+        const img = document.createElement('img');
+        img.src = c.thumbnail_url;
+        img.alt = c.title || ('card ' + c.id);
+        thumb.appendChild(img);
+      } else {
+        const ph = document.createElement('div');
+        ph.className = 'placeholder';
+        ph.textContent = c.kind;
+        thumb.appendChild(ph);
+      }
+      el.appendChild(thumb);
+
+      const m = document.createElement('div');
+      m.className = 'meta';
+      const t = document.createElement('div');
+      t.className = 'title';
+      t.textContent = c.title || ('card ' + c.id);
+      t.title = c.title || '';
+      const s = document.createElement('div');
+      s.className = 'status ' + c.status;
+      s.textContent = c.status.replace('_', ' ');
+      m.appendChild(t);
+      m.appendChild(s);
+      el.appendChild(m);
+
+      board.appendChild(el);
+      maxX = Math.max(maxX, c.x + c.width);
+      maxY = Math.max(maxY, c.y + c.height);
+    }
+    board.style.minWidth = (maxX + PAD) + 'px';
+    board.style.minHeight = (maxY + PAD) + 'px';
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/cards', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      render(data.cards || []);
+      meta.textContent = (data.cards || []).length + ' cards · updated ' +
+        new Date().toLocaleTimeString();
+    } catch (err) {
+      meta.textContent = 'error: ' + err.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+@mcp.custom_route("/board", methods=["GET"])
+async def board_page(request: Request) -> HTMLResponse:
+    return HTMLResponse(BOARD_HTML)
+
+
+@mcp.custom_route("/api/cards", methods=["GET"])
+async def api_cards(request: Request) -> JSONResponse:
+    try:
+        project_id = int(request.query_params.get("project_id", DEFAULT_PROJECT_ID))
+    except ValueError:
+        project_id = DEFAULT_PROJECT_ID
+    with _db() as c:
+        rows = c.execute(
+            "SELECT * FROM card WHERE project_id = ? AND deleted_at IS NULL "
+            "ORDER BY id",
+            (project_id,),
+        ).fetchall()
+    return JSONResponse(
+        {"project_id": project_id, "cards": [_card_to_dict(r) for r in rows]}
+    )
+
+
+def _serve_from(directory: Path, filename: str):
+    # Resolve and guard against path traversal — the resolved file must sit
+    # inside `directory`.
+    try:
+        path = (directory / filename).resolve()
+        path.relative_to(directory.resolve())
+    except (ValueError, OSError):
+        return PlainTextResponse("not found", status_code=404)
+    if not path.is_file():
+        return PlainTextResponse("not found", status_code=404)
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@mcp.custom_route("/thumbs/{filename}", methods=["GET"])
+async def serve_thumb(request: Request):
+    return _serve_from(THUMBS_DIR, request.path_params["filename"])
+
+
+@mcp.custom_route("/files/{filename}", methods=["GET"])
+async def serve_file(request: Request):
+    return _serve_from(FILES_DIR, request.path_params["filename"])
 
 
 if __name__ == "__main__":
