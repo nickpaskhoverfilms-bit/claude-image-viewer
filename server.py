@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import hmac
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -42,6 +43,24 @@ DB_PATH = DATA_DIR / "canvas.db"
 ALLOWED_KINDS = {"reference", "generation", "anchor", "video", "deliverable", "note"}
 ALLOWED_STATUSES = {"in_progress", "review", "locked"}
 DEFAULT_PROJECT_ID = 1
+
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        raise RuntimeError(
+            f"{name} environment variable is required but missing or empty. "
+            "Set it in Railway (Variables tab) before redeploying."
+        )
+    return val
+
+
+# Fail-fast: if either secret is missing, the server refuses to boot so
+# we never accidentally serve an unprotected board or MCP endpoint.
+BOARD_KEY = _require_env("BOARD_KEY")
+MCP_TOKEN = _require_env("MCP_TOKEN")
+BOARD_COOKIE = "board_session"
+BOARD_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
 
 def _now() -> str:
@@ -878,13 +897,59 @@ BOARD_HTML = """<!doctype html>
 """
 
 
+_UNAUTHORIZED_HTML = (
+    "<!doctype html><meta charset=utf-8>"
+    "<title>Canvas Board</title>"
+    "<style>body{background:#1a1a1f;color:#e8e8ea;"
+    "font-family:-apple-system,sans-serif;"
+    "display:flex;align-items:center;justify-content:center;"
+    "min-height:100vh;margin:0;text-align:center;line-height:1.6}"
+    "code{background:#24252c;padding:2px 6px;border-radius:4px;"
+    "color:#9a9ba3}</style>"
+    "<div><h1 style='font-size:16px;margin:0 0 8px'>Missing or invalid key</h1>"
+    "<p style='color:#9a9ba3;font-size:13px;margin:0'>"
+    "Append <code>?key=YOUR_KEY</code> to the URL.</p></div>"
+)
+
+
+def _board_auth_ok(request: Request) -> bool:
+    """True if the request carries a valid BOARD_KEY in either the
+    ?key= query param or the board_session cookie."""
+    candidate = request.query_params.get("key") or request.cookies.get(BOARD_COOKIE)
+    if not candidate:
+        return False
+    return hmac.compare_digest(candidate, BOARD_KEY)
+
+
+def _api_unauthorized() -> JSONResponse:
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
 @mcp.custom_route("/board", methods=["GET"])
 async def board_page(request: Request) -> HTMLResponse:
-    return HTMLResponse(BOARD_HTML)
+    if not _board_auth_ok(request):
+        return HTMLResponse(_UNAUTHORIZED_HTML, status_code=401)
+    resp = HTMLResponse(BOARD_HTML)
+    # Stash the key in a cookie so same-origin fetches, image loads, and
+    # download links work without re-passing ?key= everywhere.
+    resp.set_cookie(
+        BOARD_COOKIE,
+        BOARD_KEY,
+        max_age=BOARD_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    # Don't leak the ?key= via Referer if the user clicks an external link.
+    resp.headers["Referrer-Policy"] = "same-origin"
+    return resp
 
 
 @mcp.custom_route("/api/cards", methods=["GET"])
 async def api_cards(request: Request) -> JSONResponse:
+    if not _board_auth_ok(request):
+        return _api_unauthorized()
     try:
         project_id = int(request.query_params.get("project_id", DEFAULT_PROJECT_ID))
     except ValueError:
@@ -905,6 +970,8 @@ _PATCHABLE = ("title", "status", "notes", "x", "y")
 
 @mcp.custom_route("/api/cards/{card_id:int}", methods=["PATCH"])
 async def api_patch_card(request: Request) -> JSONResponse:
+    if not _board_auth_ok(request):
+        return _api_unauthorized()
     card_id = request.path_params["card_id"]
     try:
         body = await request.json()
@@ -951,14 +1018,26 @@ def _serve_from(directory: Path, filename: str):
 
 @mcp.custom_route("/thumbs/{filename}", methods=["GET"])
 async def serve_thumb(request: Request):
+    if not _board_auth_ok(request):
+        return _api_unauthorized()
     return _serve_from(THUMBS_DIR, request.path_params["filename"])
 
 
 @mcp.custom_route("/files/{filename}", methods=["GET"])
 async def serve_file(request: Request):
+    if not _board_auth_ok(request):
+        return _api_unauthorized()
     return _serve_from(FILES_DIR, request.path_params["filename"])
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
+    # MCP_TOKEN is embedded in the path itself: anyone hitting plain
+    # /mcp gets a 404 from FastMCP. The token is shared only with the
+    # claude.ai connector config.
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=port,
+        path=f"/mcp/{MCP_TOKEN}",
+    )
