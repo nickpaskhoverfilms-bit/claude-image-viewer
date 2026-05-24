@@ -164,26 +164,36 @@ route. The page polls `/api/cards` every 3 seconds and re-renders.
 
 ### Layout & rendering
 
-Each card is an absolutely-positioned `<div>` at its saved `x,y` with
-its saved `width,height`. The board's outer extent expands to fit the
-furthest card.
+The page is a fixed-size viewport (`#board`, `overflow: hidden`) that
+contains a single transformable child (`#stage`, `transform-origin:
+0 0`). All cards, the SVG overlay, and the dotted-grid background
+live inside `#stage`. Zoom and pan are implemented by writing
+`transform: translate(panX, panY) scale(zoom)` to `#stage`; that one
+operation moves and scales everything together.
 
-A single SVG overlay sits inside `#board` (`position: absolute;
-pointer-events: none`). It is rebuilt on every render and holds:
+The edit modal and the lightbox are `position: fixed` at the
+document root and are unaffected by zoom.
 
-1. **Section backgrounds** — cards are grouped by their `section`
-   field (empty string ignored). Each group gets a rounded rect padded
-   18px around the group's AABB, with low-opacity fill + stroke in a
-   color picked by hashing the section name. A small uppercase label
-   sits at top-left.
-2. **Lineage lines** — for any card whose `parent_card_id` matches
-   another card on the current board, a thin arrow is drawn between
-   them. Endpoints are clipped to each card's rectangle edge (via a
-   center-to-center / perimeter intersection) so the arrowhead lives
-   in the gap between the two cards. Self-loops and missing parents
-   are skipped silently.
+Inside `#stage`:
 
-Cards are appended *after* the SVG so they naturally render above it.
+- Each card is an absolutely-positioned `<div>` at its saved `x,y`
+  with its saved `width,height`. The stage's width/height are sized
+  to the furthest card so the background grid tiles correctly.
+- A single SVG overlay (`pointer-events: none`) is rebuilt on every
+  render and holds:
+  1. **Section backgrounds** — cards are grouped by their `section`
+     field (empty string ignored). Each group gets a rounded rect
+     padded 18px around the group's AABB, with low-opacity fill +
+     stroke in a color picked by hashing the section name. A small
+     uppercase label sits at top-left.
+  2. **Lineage lines** — for any card whose `parent_card_id` matches
+     another card on the current board, a thin arrow is drawn between
+     them. Endpoints are clipped to each card's rectangle edge (via a
+     center-to-center / perimeter intersection) so the arrowhead
+     lives in the gap between the two cards. Self-loops and missing
+     parents are skipped silently.
+- Cards are appended *after* the SVG so they naturally render above
+  it.
 
 ### Card visuals
 
@@ -198,9 +208,64 @@ Cards are appended *after* the SVG so they naturally render above it.
   (orange/blue/green for in_progress/review/locked), and — if the
   card has a `full_image_url` — a "↓" download button.
 - Subtle hover lift (1px translate + bigger shadow), suppressed
-  during drag.
-- Faint dotted-grid background on the board itself (24px radial
-  gradient).
+  during drag and while Space is held (pan mode).
+- Faint dotted-grid background on the stage (24px radial gradient).
+  Because the grid lives on `#stage` rather than `#board`, the dots
+  scale with zoom — content stays visually anchored to the grid at
+  every zoom level.
+
+### Zoom and pan
+
+View state is three module-scope JS vars (`zoom`, `panX`, `panY`,
+initialized to 1 / 0 / 0). A small `applyTransform()` helper writes
+the CSS transform and updates the header's zoom label. The render
+function clears and rebuilds `#stage`'s children but never touches
+those vars, so the 3-second poll preserves the user's view exactly.
+
+**Range:** zoom is clamped to 10%–400%.
+
+**Toolbar (header, right side):**
+- `−` zoom out by 1.2× around the viewport center.
+- Current zoom % — click to reset to 100% at origin.
+- `+` zoom in by 1.2× around the viewport center.
+- `Fit` — compute the AABB of all cards, pick the largest scale that
+  fits with 40px padding (capped at 100%), and center it.
+
+**Wheel:**
+- `Ctrl/Cmd + wheel` (which also catches trackpad pinch, since pinch
+  fires `WheelEvent` with `ctrlKey: true`) zooms around the cursor
+  position. The math: compute the stage-space point currently under
+  the cursor, change `zoom`, then adjust `panX`/`panY` so that same
+  stage point is still under the cursor.
+- Plain wheel / two-finger swipe pans by `(deltaX, deltaY)`.
+
+Both branches call `preventDefault()` so the page doesn't scroll.
+
+**Pan input:**
+- **Drag the empty background.** Mousedown on `#board` whose target
+  isn't a card starts a pan. Card mousedowns call
+  `e.stopPropagation()` to prevent the board's pan handler from also
+  firing.
+- **Hold Space and drag anywhere.** While Space is held the body
+  gets a `space-held` class (cursor switches to `grab`, hover lift
+  is suppressed) and any mousedown — including over a card — starts
+  a pan instead of a card drag.
+
+**Keyboard:** `+` / `−` zoom around viewport center, `0` resets to
+100% at origin, `1` fits the board. Bindings are suppressed while
+typing in an `INPUT`/`TEXTAREA`/`SELECT`.
+
+**First-load behavior:** the first poll that returns cards checks
+whether the content fits inside the viewport at 100%. If yes, the
+view stays at 100% / origin. If no, `fitToScreen()` runs once. After
+that first paint the flag `didInitialFit` is set and subsequent
+renders never auto-fit again, so the user's zoom and pan are
+preserved.
+
+**Card drag at zoom != 1:** the mouse delta is in screen pixels but
+card `x,y` is in stage pixels, so the drag handler divides the
+delta by `zoom` before adding it to the start position. This keeps
+the card under the cursor at every zoom level.
 
 ### Interactions
 
@@ -221,9 +286,9 @@ Cards are appended *after* the SVG so they naturally render above it.
   `stopPropagation`'d so the button doesn't trigger drag or the
   editor.
 
-Three flags — `dragging`, `editing`, `viewing` — pause the polling
-refresh while the user is in the middle of any of those interactions,
-so the DOM is never rebuilt out from under them.
+Four flags — `dragging`, `editing`, `viewing`, `panning` — pause the
+polling refresh while the user is in the middle of any of those
+interactions, so the DOM is never rebuilt out from under them.
 
 ### HTTP API (used by the board)
 
