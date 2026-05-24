@@ -378,12 +378,29 @@ BOARD_HTML = """<!doctype html>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  header { position: sticky; top: 0; z-index: 10; padding: 10px 16px;
+  body { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  header { flex: 0 0 auto; z-index: 10; padding: 10px 16px;
     background: rgba(26,26,31,0.92); border-bottom: 1px solid var(--panel-border);
     display: flex; align-items: center; gap: 12px; }
   header h1 { font-size: 14px; font-weight: 600; margin: 0; }
   header .meta { font-size: 12px; color: var(--muted); }
-  #board { position: relative; width: 100%; min-height: calc(100vh - 44px);
+  header .spacer { flex: 1; }
+  .zoom-bar { display: flex; gap: 2px; }
+  .zoom-bar button { background: #2a2b33; color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 4px;
+    font-size: 12px; padding: 4px 10px; cursor: pointer;
+    font-family: inherit; line-height: 1; min-width: 30px;
+    height: 26px; }
+  .zoom-bar button:hover { background: #34353d; }
+  .zoom-bar #z-label { min-width: 56px; font-variant-numeric: tabular-nums; }
+  #board { flex: 1; position: relative; overflow: hidden;
+    cursor: grab; background: var(--bg); }
+  #board.panning, body.space-held #board { cursor: grabbing; }
+  body.space-held .card { cursor: grab !important; }
+  body.space-held .card:hover { transform: none;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+  #stage { position: absolute; top: 0; left: 0;
+    transform-origin: 0 0; will-change: transform;
     background-image: radial-gradient(circle, var(--grid-dot) 1px, transparent 1px);
     background-size: 24px 24px; background-position: 0 0; }
   #board-svg { position: absolute; top: 0; left: 0; pointer-events: none;
@@ -426,9 +443,11 @@ BOARD_HTML = """<!doctype html>
     padding: 2px 7px; border-radius: 4px; line-height: 1; cursor: pointer;
     border: 1px solid var(--panel-border); background: #1d1e24; }
   .dl-btn:hover { color: var(--text); background: #2a2b33; }
-  .empty { position: absolute; top: 40%; left: 50%;
-    transform: translate(-50%, -50%); color: var(--muted);
-    font-size: 13px; text-align: center; line-height: 1.6; }
+  .empty { position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center; flex-direction: column;
+    color: var(--muted); font-size: 13px; text-align: center;
+    line-height: 1.6; pointer-events: none; }
+  .empty.hidden { display: none; }
   .empty .small { display: block; font-size: 11px; margin-top: 4px;
     color: #6b6c75; }
 
@@ -486,8 +505,18 @@ BOARD_HTML = """<!doctype html>
 <header>
   <h1>Canvas Board</h1>
   <span class="meta" id="meta">loading…</span>
+  <div class="spacer"></div>
+  <div class="zoom-bar">
+    <button id="z-out" title="Zoom out (−)">−</button>
+    <button id="z-label" title="Reset to 100% (0)">100%</button>
+    <button id="z-in" title="Zoom in (+)">+</button>
+    <button id="z-fit" title="Fit to screen (1)">Fit</button>
+  </div>
 </header>
-<div id="board"><div class="empty" id="empty">loading…</div></div>
+<div id="board">
+  <div id="stage"></div>
+  <div class="empty" id="empty">loading…</div>
+</div>
 
 <div id="modal" class="hidden">
   <div class="modal-backdrop" data-close="1"></div>
@@ -522,6 +551,8 @@ BOARD_HTML = """<!doctype html>
 
 <script>
   const board = document.getElementById('board');
+  const stage = document.getElementById('stage');
+  const empty = document.getElementById('empty');
   const meta = document.getElementById('meta');
   const modal = document.getElementById('modal');
   const edHeading = document.getElementById('ed-heading');
@@ -532,10 +563,17 @@ BOARD_HTML = """<!doctype html>
   const edSave = document.getElementById('ed-save');
   const lightbox = document.getElementById('lightbox');
   const lbImg = document.getElementById('lb-img');
+  const zOut = document.getElementById('z-out');
+  const zIn = document.getElementById('z-in');
+  const zLabel = document.getElementById('z-label');
+  const zFit = document.getElementById('z-fit');
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const PAD = 40;
   const SECTION_PAD = 18;
   const DRAG_THRESHOLD = 4;
+  const MIN_ZOOM = 0.1;
+  const MAX_ZOOM = 4.0;
+  const ZOOM_STEP = 1.2;
   const KIND_COLORS = {
     reference: '#6b7280',
     generation: '#a855f7',
@@ -548,9 +586,20 @@ BOARD_HTML = """<!doctype html>
     '#4f46e5', '#0891b2', '#16a34a',
     '#d97706', '#db2777', '#7c3aed',
   ];
+
+  // Interaction state.
   let dragging = null;
   let editing = null;
   let viewing = null;
+  let panning = null;
+  let spaceHeld = false;
+
+  // View state — preserved across refreshes.
+  let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  let lastCards = [];
+  let didInitialFit = false;
 
   function safeFilename(s) {
     return (s || 'image').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'image';
@@ -587,33 +636,111 @@ BOARD_HTML = """<!doctype html>
     return { x: cx + dx * s, y: cy + dy * s };
   }
 
+  // ===== Zoom + pan =====
+  function applyTransform() {
+    stage.style.transform =
+      'translate(' + panX + 'px, ' + panY + 'px) scale(' + zoom + ')';
+    zLabel.textContent = Math.round(zoom * 100) + '%';
+  }
+
+  function clampZoom(z) {
+    return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+  }
+
+  // Zoom to a new level while keeping the stage point currently under
+  // (clientX, clientY) under that same screen position. Coordinates are
+  // page client coords; we convert into board-local space.
+  function zoomAt(newZoom, clientX, clientY) {
+    newZoom = clampZoom(newZoom);
+    if (newZoom === zoom) return;
+    const r = board.getBoundingClientRect();
+    const localX = clientX - r.left;
+    const localY = clientY - r.top;
+    const stageX = (localX - panX) / zoom;
+    const stageY = (localY - panY) / zoom;
+    zoom = newZoom;
+    panX = localX - stageX * zoom;
+    panY = localY - stageY * zoom;
+    applyTransform();
+  }
+
+  function viewportCenter() {
+    const r = board.getBoundingClientRect();
+    return [r.left + r.width / 2, r.top + r.height / 2];
+  }
+
+  function resetView() {
+    zoom = 1; panX = 0; panY = 0;
+    applyTransform();
+  }
+
+  function contentExtent(cards) {
+    if (!cards.length) return null;
+    let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
+    for (const c of cards) {
+      minX = Math.min(minX, c.x);
+      minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x + c.width);
+      maxY = Math.max(maxY, c.y + c.height);
+    }
+    return { minX, minY, maxX, maxY,
+             w: maxX - minX, h: maxY - minY };
+  }
+
+  function fitsAtIdentity(cards) {
+    const ext = contentExtent(cards);
+    if (!ext) return true;
+    return ext.minX >= 0 && ext.minY >= 0
+      && ext.maxX <= board.clientWidth
+      && ext.maxY <= board.clientHeight;
+  }
+
+  function fitToScreen() {
+    const ext = contentExtent(lastCards);
+    if (!ext) { resetView(); return; }
+    const vw = board.clientWidth;
+    const vh = board.clientHeight;
+    const pad = 40;
+    const z = clampZoom(Math.min(
+      (vw - pad * 2) / ext.w,
+      (vh - pad * 2) / ext.h,
+      1
+    ));
+    zoom = z;
+    panX = (vw - ext.w * zoom) / 2 - ext.minX * zoom;
+    panY = (vh - ext.h * zoom) / 2 - ext.minY * zoom;
+    applyTransform();
+  }
+
+  // ===== Render =====
   function render(cards) {
-    board.innerHTML = '';
+    lastCards = cards;
+    stage.innerHTML = '';
     if (!cards.length) {
-      const e = document.createElement('div');
-      e.className = 'empty';
-      e.innerHTML = 'no cards yet' +
+      empty.innerHTML = 'no cards yet' +
         '<span class="small">add one with the MCP add_card tool</span>';
-      board.appendChild(e);
+      empty.classList.remove('hidden');
+      stage.style.width = '0px';
+      stage.style.height = '0px';
+      applyTransform();
       return;
     }
+    empty.classList.add('hidden');
 
     let maxX = 0, maxY = 0;
     for (const c of cards) {
       maxX = Math.max(maxX, c.x + c.width);
       maxY = Math.max(maxY, c.y + c.height);
     }
-    const boardW = maxX + PAD;
-    const boardH = maxY + PAD;
-    board.style.minWidth = boardW + 'px';
-    board.style.minHeight = boardH + 'px';
+    const stageW = maxX + PAD;
+    const stageH = maxY + PAD;
+    stage.style.width = stageW + 'px';
+    stage.style.height = stageH + 'px';
 
-    // SVG overlay sits behind the cards. Sections first (lowest), then
-    // lineage lines, then the cards themselves get appended on top.
     const svg = svgEl('svg', {
       id: 'board-svg',
-      width: boardW, height: boardH,
-      viewBox: '0 0 ' + boardW + ' ' + boardH,
+      width: stageW, height: stageH,
+      viewBox: '0 0 ' + stageW + ' ' + stageH,
     });
 
     const defs = svgEl('defs');
@@ -628,9 +755,6 @@ BOARD_HTML = """<!doctype html>
     defs.appendChild(marker);
     svg.appendChild(defs);
 
-    // Sections: group active cards by non-empty section, draw a soft
-    // tinted rounded rect that just visualizes where those cards happen
-    // to be — it doesn't constrain anything.
     const sectionGroup = svgEl('g', { class: 'sections' });
     const bySection = new Map();
     for (const c of cards) {
@@ -667,8 +791,6 @@ BOARD_HTML = """<!doctype html>
     }
     svg.appendChild(sectionGroup);
 
-    // Lineage lines: parent → child arrows, terminated at each card's
-    // edge so the arrowhead lives in the gap between them.
     const cardById = new Map(cards.map((c) => [c.id, c]));
     const lineGroup = svgEl('g', { class: 'lines' });
     for (const child of cards) {
@@ -688,9 +810,8 @@ BOARD_HTML = """<!doctype html>
       }));
     }
     svg.appendChild(lineGroup);
-    board.appendChild(svg);
+    stage.appendChild(svg);
 
-    // Cards on top.
     for (const c of cards) {
       const el = document.createElement('div');
       el.className = 'card';
@@ -746,13 +867,23 @@ BOARD_HTML = """<!doctype html>
       }
       el.appendChild(m);
 
-      el.addEventListener('mousedown', (e) => startDrag(e, c, el));
-      board.appendChild(el);
+      el.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        e.stopPropagation();
+        if (spaceHeld) {
+          startPan(e);
+        } else {
+          startDrag(e, c, el);
+        }
+      });
+      stage.appendChild(el);
     }
+
+    applyTransform();
   }
 
+  // ===== Card drag =====
   function startDrag(e, card, el) {
-    if (e.button !== 0) return;
     dragging = {
       card, el,
       startX: card.x, startY: card.y,
@@ -763,7 +894,30 @@ BOARD_HTML = """<!doctype html>
     e.preventDefault();
   }
 
+  // ===== Board pan =====
+  function startPan(e) {
+    panning = {
+      startPanX: panX, startPanY: panY,
+      mouseStartX: e.clientX, mouseStartY: e.clientY,
+    };
+    board.classList.add('panning');
+    e.preventDefault();
+  }
+
+  board.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    // Card mousedowns stopPropagation, so anything reaching here is a
+    // background click → pan.
+    startPan(e);
+  });
+
   document.addEventListener('mousemove', (e) => {
+    if (panning) {
+      panX = panning.startPanX + (e.clientX - panning.mouseStartX);
+      panY = panning.startPanY + (e.clientY - panning.mouseStartY);
+      applyTransform();
+      return;
+    }
     if (!dragging) return;
     const dx = e.clientX - dragging.mouseStartX;
     const dy = e.clientY - dragging.mouseStartY;
@@ -772,8 +926,9 @@ BOARD_HTML = """<!doctype html>
       dragging.el.classList.add('dragging');
     }
     if (dragging.moved) {
-      const nx = Math.max(0, dragging.startX + dx);
-      const ny = Math.max(0, dragging.startY + dy);
+      // Mouse delta is in screen pixels; convert to stage pixels.
+      const nx = Math.max(0, dragging.startX + dx / zoom);
+      const ny = Math.max(0, dragging.startY + dy / zoom);
       dragging.el.style.left = nx + 'px';
       dragging.el.style.top = ny + 'px';
       dragging.card.x = nx;
@@ -782,6 +937,11 @@ BOARD_HTML = """<!doctype html>
   });
 
   document.addEventListener('mouseup', async (e) => {
+    if (panning) {
+      panning = null;
+      board.classList.remove('panning');
+      return;
+    }
     if (!dragging) return;
     const d = dragging;
     dragging = null;
@@ -806,6 +966,21 @@ BOARD_HTML = """<!doctype html>
     }
   });
 
+  // ===== Wheel: Ctrl/Cmd to zoom, otherwise pan =====
+  board.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      // Smoothly scale by deltaY. Trackpad pinch reports small deltas.
+      const factor = Math.exp(-e.deltaY * 0.01);
+      zoomAt(zoom * factor, e.clientX, e.clientY);
+    } else {
+      panX -= e.deltaX;
+      panY -= e.deltaY;
+      applyTransform();
+    }
+  }, { passive: false });
+
+  // ===== Edit modal =====
   function openEditor(card) {
     editing = { id: card.id };
     edHeading.textContent = 'Edit card · ' + (card.title || ('#' + card.id));
@@ -843,12 +1018,61 @@ BOARD_HTML = """<!doctype html>
   lightbox.addEventListener('click', (e) => {
     if (e.target.dataset && e.target.dataset.close) closeLightbox();
   });
+
+  // ===== Keyboard =====
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+
   document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
-    if (viewing) closeLightbox();
-    else if (editing) closeEditor();
+    if (e.key === 'Escape') {
+      if (viewing) { closeLightbox(); return; }
+      if (editing) { closeEditor(); return; }
+    }
+    if (isTypingTarget(e.target)) return;
+    if (e.key === ' ') {
+      if (!spaceHeld) {
+        spaceHeld = true;
+        document.body.classList.add('space-held');
+      }
+      e.preventDefault();
+      return;
+    }
+    if (e.key === '+' || e.key === '=') {
+      zoomAt(zoom * ZOOM_STEP, ...viewportCenter());
+      e.preventDefault();
+    } else if (e.key === '-' || e.key === '_') {
+      zoomAt(zoom / ZOOM_STEP, ...viewportCenter());
+      e.preventDefault();
+    } else if (e.key === '0') {
+      resetView();
+      e.preventDefault();
+    } else if (e.key === '1') {
+      fitToScreen();
+      e.preventDefault();
+    }
   });
 
+  document.addEventListener('keyup', (e) => {
+    if (e.key === ' ' && spaceHeld) {
+      spaceHeld = false;
+      document.body.classList.remove('space-held');
+    }
+  });
+
+  // ===== Zoom toolbar =====
+  zOut.addEventListener('click', () => {
+    zoomAt(zoom / ZOOM_STEP, ...viewportCenter());
+  });
+  zIn.addEventListener('click', () => {
+    zoomAt(zoom * ZOOM_STEP, ...viewportCenter());
+  });
+  zLabel.addEventListener('click', () => { resetView(); });
+  zFit.addEventListener('click', () => { fitToScreen(); });
+
+  // ===== Edit save =====
   edSave.addEventListener('click', async () => {
     if (!editing) return;
     edSave.disabled = true;
@@ -875,20 +1099,28 @@ BOARD_HTML = """<!doctype html>
     }
   });
 
+  // ===== Poll =====
   async function refresh() {
-    if (dragging || editing || viewing) return;
+    if (dragging || editing || viewing || panning) return;
     try {
       const r = await fetch('/api/cards', { cache: 'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
-      render(data.cards || []);
-      meta.textContent = (data.cards || []).length + ' cards · updated ' +
+      const cards = data.cards || [];
+      render(cards);
+      // First time we get real cards, optionally fit-to-screen.
+      if (!didInitialFit && cards.length) {
+        didInitialFit = true;
+        if (!fitsAtIdentity(cards)) fitToScreen();
+      }
+      meta.textContent = cards.length + ' cards · updated ' +
         new Date().toLocaleTimeString();
     } catch (err) {
       meta.textContent = 'error: ' + err.message;
     }
   }
 
+  applyTransform();
   refresh();
   setInterval(refresh, 3000);
 </script>
