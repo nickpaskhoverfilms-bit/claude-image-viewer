@@ -3,13 +3,15 @@ import io
 import json
 import hmac
 import sqlite3
+import subprocess
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageDraw, ImageFont
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from starlette.requests import Request
@@ -43,6 +45,14 @@ DB_PATH = DATA_DIR / "canvas.db"
 ALLOWED_KINDS = {"reference", "generation", "anchor", "video", "deliverable", "note"}
 ALLOWED_STATUSES = {"in_progress", "review", "locked"}
 DEFAULT_PROJECT_ID = 1
+
+# Video overview / contact-sheet settings.
+MAX_VIDEO_BYTES = 500 * 1024 * 1024
+OVERVIEW_FRAMES = 12
+OVERVIEW_COLS = 4
+OVERVIEW_ROWS = 3
+OVERVIEW_LONG_EDGE = 1280
+OVERVIEW_GAP = 4
 
 
 def _require_env(name: str) -> str:
@@ -213,6 +223,195 @@ def view_asset(url: str) -> Image:
 def compare_assets(urls: list[str]) -> list[Image]:
     """Download up to 4 images from URLs so they can be compared side by side."""
     return [Image(data=shrink(u, 1024), format="jpeg") for u in urls[:4]]
+
+
+def _format_timestamp(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
+def _download_video(url: str, dest_path: str) -> None:
+    """Stream a video to dest_path with a hard byte cap. Raises ValueError
+    if the source declares or exceeds MAX_VIDEO_BYTES."""
+    written = 0
+    with httpx.stream("GET", url, timeout=300, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        cl = resp.headers.get("content-length")
+        if cl:
+            try:
+                if int(cl) > MAX_VIDEO_BYTES:
+                    raise ValueError(
+                        f"video too large: {int(cl)} bytes "
+                        f"(max {MAX_VIDEO_BYTES})"
+                    )
+            except ValueError as e:
+                if "too large" in str(e):
+                    raise
+                # Malformed content-length; fall through to streamed cap.
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                written += len(chunk)
+                if written > MAX_VIDEO_BYTES:
+                    raise ValueError(
+                        f"video exceeded {MAX_VIDEO_BYTES}-byte cap "
+                        f"mid-download"
+                    )
+                f.write(chunk)
+
+
+def _ffprobe_duration(path: str) -> float:
+    proc = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe failed: {proc.stderr.strip() or 'unknown error'}"
+        )
+    out = proc.stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        raise RuntimeError(f"ffprobe returned non-numeric duration: {out!r}")
+
+
+def _ffmpeg_frame(path: str, t: float) -> PILImage.Image:
+    """Extract a single frame at timestamp t (fast seek) as a Pillow image."""
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-loglevel", "error",
+            "-ss", f"{max(0.0, t):.3f}", "-i", path,
+            "-frames:v", "1", "-q:v", "3",
+            "-f", "image2pipe", "-vcodec", "mjpeg", "-",
+        ],
+        capture_output=True, timeout=30,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        err = proc.stderr.decode("utf-8", "ignore").strip()[:200]
+        raise RuntimeError(f"ffmpeg failed at t={t:.2f}s: {err}")
+    return PILImage.open(io.BytesIO(proc.stdout)).convert("RGB")
+
+
+def _load_label_font(size: int = 14) -> ImageFont.ImageFont:
+    # DejaVu ships with Debian (Nixpacks). Fall back to PIL's default if
+    # it's missing for any reason — labels will be smaller but render.
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+@mcp.tool
+def get_video_overview(video_url: str) -> Image:
+    """Download a video and return a single contact-sheet image showing
+    12 frames sampled evenly across the clip, each labeled with its
+    timestamp.
+
+    Useful for getting a quick sense of a video's content, pacing, or
+    structure without watching it. The sheet is a 4-column x 3-row JPEG
+    sized so the long edge stays around 1280 px (well within typical
+    image-transport limits).
+
+    Pass a direct video URL (mp4, mov, webm, etc.) — streaming manifests
+    (m3u8, dash) are not supported. Videos larger than 500 MB are
+    rejected.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+    tmp.close()
+    tmp_path = tmp.name
+    try:
+        _download_video(video_url, tmp_path)
+        duration = _ffprobe_duration(tmp_path)
+        if duration <= 0:
+            raise RuntimeError("video duration probe returned 0")
+
+        # Sample timestamps evenly, skipping a small head/tail margin so
+        # we don't lock onto title/end cards.
+        margin = min(0.5, duration * 0.05)
+        start, end = margin, max(duration - margin, margin)
+        if OVERVIEW_FRAMES == 1 or end <= start:
+            timestamps = [(start + end) / 2] * OVERVIEW_FRAMES
+        else:
+            step = (end - start) / (OVERVIEW_FRAMES - 1)
+            timestamps = [start + i * step for i in range(OVERVIEW_FRAMES)]
+
+        frames = [(_ffmpeg_frame(tmp_path, t), t) for t in timestamps]
+
+        # Size tiles from the first frame's aspect ratio so neither the
+        # sheet width nor its height exceeds OVERVIEW_LONG_EDGE.
+        src_w, src_h = frames[0][0].size
+        gap = OVERVIEW_GAP
+        cap_w = (OVERVIEW_LONG_EDGE - (OVERVIEW_COLS + 1) * gap) / OVERVIEW_COLS
+        cap_h = (
+            (OVERVIEW_LONG_EDGE - (OVERVIEW_ROWS + 1) * gap) / OVERVIEW_ROWS
+        ) * (src_w / src_h)
+        tile_w = max(1, int(min(cap_w, cap_h)))
+        tile_h = max(1, int(tile_w * src_h / src_w))
+        sheet_w = OVERVIEW_COLS * tile_w + (OVERVIEW_COLS + 1) * gap
+        sheet_h = OVERVIEW_ROWS * tile_h + (OVERVIEW_ROWS + 1) * gap
+
+        sheet = PILImage.new("RGB", (sheet_w, sheet_h), (18, 18, 22))
+        for i, (frame, _t) in enumerate(frames):
+            col = i % OVERVIEW_COLS
+            row = i // OVERVIEW_COLS
+            x = gap + col * (tile_w + gap)
+            y = gap + row * (tile_h + gap)
+            thumb = frame.copy()
+            thumb.thumbnail((tile_w, tile_h))
+            ox = x + (tile_w - thumb.size[0]) // 2
+            oy = y + (tile_h - thumb.size[1]) // 2
+            sheet.paste(thumb, (ox, oy))
+
+        # Draw timestamp pills on a translucent overlay so labels stay
+        # readable over any frame content; then composite onto the sheet.
+        font = _load_label_font(14)
+        overlay = PILImage.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        for i, (_frame, t) in enumerate(frames):
+            col = i % OVERVIEW_COLS
+            row = i // OVERVIEW_COLS
+            x = gap + col * (tile_w + gap)
+            y = gap + row * (tile_h + gap)
+            label = _format_timestamp(t)
+            bbox = odraw.textbbox((0, 0), label, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            pad = 5
+            bx = x + 6
+            by = y + tile_h - th - pad * 2 - 6
+            odraw.rectangle(
+                [bx, by, bx + tw + pad * 2, by + th + pad * 2],
+                fill=(0, 0, 0, 180),
+            )
+            odraw.text(
+                (bx + pad - bbox[0], by + pad - bbox[1]),
+                label, fill=(255, 255, 255, 255), font=font,
+            )
+
+        final = PILImage.alpha_composite(
+            sheet.convert("RGBA"), overlay
+        ).convert("RGB")
+        out = io.BytesIO()
+        final.save(out, format="JPEG", quality=85)
+        return Image(data=out.getvalue(), format="jpeg")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 @mcp.tool
