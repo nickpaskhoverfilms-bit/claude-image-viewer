@@ -54,6 +54,10 @@ OVERVIEW_ROWS = 3
 OVERVIEW_LONG_EDGE = 1280
 OVERVIEW_GAP = 4
 
+# Per-frame extract settings.
+EXTRACT_MAX_FRAMES = 8
+EXTRACT_LONG_EDGE = 1568
+
 
 def _require_env(name: str) -> str:
     val = os.environ.get(name, "").strip()
@@ -407,6 +411,137 @@ def get_video_overview(video_url: str) -> Image:
         out = io.BytesIO()
         final.save(out, format="JPEG", quality=85)
         return Image(data=out.getvalue(), format="jpeg")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _parse_time(s) -> float:
+    """Parse a time given as seconds ('42', '42.5') or as a colon-
+    separated string ('1:23' = m:ss, '0:01:23' = h:mm:ss) into float
+    seconds. Numeric inputs pass through. Raises ValueError on garbage.
+    """
+    if isinstance(s, (int, float)):
+        return float(s)
+    if s is None:
+        raise ValueError("time is required")
+    s = str(s).strip()
+    if not s:
+        raise ValueError("time string is empty")
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            if len(parts) == 2:
+                m, sec = parts
+                return int(m) * 60 + float(sec)
+            if len(parts) == 3:
+                h, m, sec = parts
+                return int(h) * 3600 + int(m) * 60 + float(sec)
+        except ValueError:
+            raise ValueError(f"unrecognized time format: {s!r}")
+        raise ValueError(f"unrecognized time format: {s!r}")
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"unrecognized time format: {s!r}")
+
+
+def _draw_timestamp_label(img: PILImage.Image, label: str) -> PILImage.Image:
+    """Return a copy of img with a small translucent timestamp pill in
+    the bottom-left corner (same visual style as the contact-sheet
+    overview labels)."""
+    w, h = img.size
+    font_size = max(14, min(w, h) // 40)
+    font = _load_label_font(font_size)
+    overlay = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+    bbox = odraw.textbbox((0, 0), label, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = max(5, font_size // 3)
+    margin = max(6, font_size // 2)
+    bx = margin
+    by = h - th - pad * 2 - margin
+    odraw.rectangle(
+        [bx, by, bx + tw + pad * 2, by + th + pad * 2],
+        fill=(0, 0, 0, 180),
+    )
+    odraw.text(
+        (bx + pad - bbox[0], by + pad - bbox[1]),
+        label, fill=(255, 255, 255, 255), font=font,
+    )
+    return PILImage.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+@mcp.tool
+def extract_frames(
+    video_url: str,
+    start_time: str,
+    end_time: str,
+) -> list[Image]:
+    """Download a video and return frames from a specific time window,
+    each labeled in the bottom-left with its timestamp.
+
+    start_time and end_time accept either seconds ("42", "42.5") or
+    colon strings ("1:23" for m:ss, "0:01:23" for h:mm:ss).
+
+    Up to 8 frames are returned. For windows of 8 seconds or less the
+    count is roughly one frame per second; for longer windows 8 frames
+    are sampled evenly across the window, endpoints inclusive. Each
+    frame is downscaled so its long edge is at most 1568 px.
+
+    Use this after get_video_overview to inspect a specific beat in
+    more detail (e.g. QA on a particular shot). Videos larger than
+    500 MB are rejected.
+    """
+    try:
+        start = _parse_time(start_time)
+        end = _parse_time(end_time)
+    except ValueError as e:
+        raise ValueError(f"invalid time: {e}")
+    if start < 0:
+        raise ValueError("start_time must be >= 0")
+    if start >= end:
+        raise ValueError("start_time must be less than end_time")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+    tmp.close()
+    tmp_path = tmp.name
+    try:
+        _download_video(video_url, tmp_path)
+        duration = _ffprobe_duration(tmp_path)
+        if duration <= 0:
+            raise RuntimeError("video duration probe returned 0")
+        if start >= duration:
+            raise ValueError(
+                f"start_time {start:.2f}s is past video duration "
+                f"{duration:.2f}s"
+            )
+        end = min(end, duration)
+        if end <= start:
+            raise ValueError(
+                f"clamped end_time {end:.2f}s is not after "
+                f"start_time {start:.2f}s"
+            )
+
+        window = end - start
+        n = min(EXTRACT_MAX_FRAMES, max(1, round(window)))
+        if n == 1:
+            timestamps = [start]
+        else:
+            step = window / (n - 1)
+            timestamps = [start + i * step for i in range(n)]
+
+        results = []
+        for ts in timestamps:
+            frame = _ffmpeg_frame(tmp_path, ts)
+            frame.thumbnail((EXTRACT_LONG_EDGE, EXTRACT_LONG_EDGE))
+            labeled = _draw_timestamp_label(frame, _format_timestamp(ts))
+            buf = io.BytesIO()
+            labeled.save(buf, format="JPEG", quality=85)
+            results.append(Image(data=buf.getvalue(), format="jpeg"))
+        return results
     finally:
         try:
             os.unlink(tmp_path)
