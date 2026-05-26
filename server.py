@@ -880,13 +880,15 @@ BOARD_HTML = """<!doctype html>
 
   /* Lightbox */
   #lightbox.hidden { display: none; }
+  #lb-img.hidden, #lb-video.hidden { display: none; }
   #lightbox { position: fixed; inset: 0; z-index: 150;
     display: flex; align-items: center; justify-content: center; }
   .lb-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.88);
     cursor: zoom-out; }
-  #lb-img { position: relative; max-width: 92vw; max-height: 92vh;
+  #lb-img, #lb-video { position: relative; max-width: 92vw; max-height: 92vh;
     object-fit: contain; box-shadow: 0 30px 80px rgba(0,0,0,0.8);
     border-radius: 4px; }
+  #lb-video { background: #000; }
   #lb-hint { position: absolute; bottom: 16px; left: 50%;
     transform: translateX(-50%); color: var(--muted); font-size: 11px;
     letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.7;
@@ -938,6 +940,7 @@ BOARD_HTML = """<!doctype html>
 <div id="lightbox" class="hidden">
   <div class="lb-backdrop" data-close="1"></div>
   <img id="lb-img" alt="">
+  <video id="lb-video" class="hidden" controls preload="metadata" playsinline></video>
   <div id="lb-hint">click backdrop or press Esc to close</div>
 </div>
 
@@ -955,6 +958,7 @@ BOARD_HTML = """<!doctype html>
   const edSave = document.getElementById('ed-save');
   const lightbox = document.getElementById('lightbox');
   const lbImg = document.getElementById('lb-img');
+  const lbVideo = document.getElementById('lb-video');
   const zOut = document.getElementById('z-out');
   const zIn = document.getElementById('z-in');
   const zLabel = document.getElementById('z-label');
@@ -995,6 +999,14 @@ BOARD_HTML = """<!doctype html>
 
   function safeFilename(s) {
     return (s || 'image').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'image';
+  }
+
+  function videoExtFromUrl(u) {
+    try {
+      const path = new URL(u, location.href).pathname;
+      const m = path.match(/\.([a-z0-9]{1,5})$/i);
+      return m ? m[1].toLowerCase() : 'mp4';
+    } catch (_) { return 'mp4'; }
   }
 
   function svgEl(tag, attrs) {
@@ -1246,12 +1258,15 @@ BOARD_HTML = """<!doctype html>
       m.appendChild(k);
       m.appendChild(s);
 
-      if (c.full_image_url) {
+      const isVideoCard = c.kind === 'video' && c.source_url;
+      const dlHref = isVideoCard ? c.source_url : c.full_image_url;
+      if (dlHref) {
+        const ext = isVideoCard ? videoExtFromUrl(c.source_url) : 'jpg';
         const dl = document.createElement('a');
         dl.className = 'dl-btn';
-        dl.href = c.full_image_url;
-        dl.download = safeFilename(c.title || ('card_' + c.id)) + '.jpg';
-        dl.title = 'Download full image';
+        dl.href = dlHref;
+        dl.download = safeFilename(c.title || ('card_' + c.id)) + '.' + ext;
+        dl.title = isVideoCard ? 'Download video' : 'Download full image';
         dl.textContent = '↓';
         dl.addEventListener('mousedown', (e) => e.stopPropagation());
         dl.addEventListener('click', (e) => e.stopPropagation());
@@ -1350,7 +1365,10 @@ BOARD_HTML = """<!doctype html>
       }
       refresh();
     } else {
-      if (d.target.closest('.thumb') && d.card.full_image_url) {
+      const hitThumb = d.target.closest('.thumb');
+      if (hitThumb && d.card.kind === 'video' && d.card.source_url) {
+        openLightboxVideo(d.card);
+      } else if (hitThumb && d.card.full_image_url) {
         openLightbox(d.card.full_image_url, d.card.title);
       } else {
         openEditor(d.card);
@@ -1392,8 +1410,21 @@ BOARD_HTML = """<!doctype html>
 
   function openLightbox(url, title) {
     viewing = url;
+    lbVideo.classList.add('hidden');
+    lbImg.classList.remove('hidden');
     lbImg.src = url;
     lbImg.alt = title || '';
+    lightbox.classList.remove('hidden');
+  }
+
+  function openLightboxVideo(card) {
+    viewing = card.source_url;
+    lbImg.classList.add('hidden');
+    lbImg.removeAttribute('src');
+    lbVideo.classList.remove('hidden');
+    if (card.full_image_url) lbVideo.poster = card.full_image_url;
+    else lbVideo.removeAttribute('poster');
+    lbVideo.src = card.source_url;
     lightbox.classList.remove('hidden');
   }
 
@@ -1401,6 +1432,10 @@ BOARD_HTML = """<!doctype html>
     viewing = null;
     lightbox.classList.add('hidden');
     lbImg.removeAttribute('src');
+    lbVideo.pause();
+    lbVideo.removeAttribute('src');
+    lbVideo.removeAttribute('poster');
+    lbVideo.load();
     refresh();
   }
 
@@ -1423,6 +1458,7 @@ BOARD_HTML = """<!doctype html>
       if (viewing) { closeLightbox(); return; }
       if (editing) { closeEditor(); return; }
     }
+    if (viewing) return;
     if (isTypingTarget(e.target)) return;
     if (e.key === ' ') {
       if (!spaceHeld) {

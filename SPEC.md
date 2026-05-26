@@ -331,14 +331,31 @@ the card under the cursor at every zoom level.
   opens a modal with Title (input) / Status (dropdown) / Notes
   (textarea). Save sends all three via `PATCH /api/cards/{id}`. Esc
   or backdrop click cancels.
-- **Click thumbnail to view full image.** A non-drag click on the
-  thumbnail opens an in-page lightbox (dimmed backdrop, image fit to
-  92vw/92vh). Backdrop click or Esc closes it. The board stays mounted
-  behind it.
+- **Click thumbnail to view full image / play video.** A non-drag
+  click on the thumbnail opens an in-page lightbox (dimmed backdrop,
+  media fit to 92vw/92vh). For an image card the lightbox shows an
+  `<img>`; for a video card (`kind === 'video'` and `source_url`
+  present) it instead shows an HTML5 `<video controls preload="metadata"
+  playsinline>` pointed at `source_url`, with the saved frame
+  (`full_image_url`) used as the `<video>` poster so something is
+  visible while the clip loads. The two media elements live side by
+  side inside the lightbox; each open-function shows its own element
+  and hides the other so swapping between an image lightbox and a
+  video lightbox never leaves a blank box. Close tears down the
+  `<video>` (`pause()` + remove `src`/`poster` + `load()`) so it
+  stops buffering and audio. While the lightbox is open
+  (`viewing` truthy) the keydown handler returns early after the
+  Escape-to-close check, so Space, `+`, `−`, `0`, `1` don't reach
+  the board while a video is playing. Backdrop click or Esc closes
+  it. The board stays mounted behind it.
 - **Download.** The "↓" anchor uses the HTML5 `download` attribute
-  with a sanitized filename `<title>.jpg`. `mousedown` / `click` are
-  `stopPropagation`'d so the button doesn't trigger drag or the
-  editor.
+  with a sanitized filename `<title>.<ext>`. For image cards `ext`
+  is `jpg` and the href is `full_image_url`. For video cards
+  (`kind === 'video'` and `source_url` present) the href is the
+  original `source_url` so the user gets the actual clip; the
+  extension is sniffed from the URL pathname (last `.xxx`), falling
+  back to `mp4`. `mousedown` / `click` are `stopPropagation`'d so
+  the button doesn't trigger drag or the editor.
 
 Four flags — `dragging`, `editing`, `viewing`, `panning` — pause the
 polling refresh while the user is in the middle of any of those
