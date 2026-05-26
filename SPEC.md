@@ -14,12 +14,20 @@ The whole server is a single Python file (`server.py`) running on Railway.
 
 ## Deployment
 
-- **Hosting:** Railway, single web process. `Procfile` declares `web:
-  python server.py`.
-- **Python deps:** `fastmcp`, `httpx`, `pillow` (`requirements.txt`).
-  Requires Python 3.10+ (FastMCP requirement).
+- **Hosting:** Railway, single web process built from the repo root
+  `Dockerfile` (`python:3.11-slim` base, `CMD ["python", "server.py"]`).
+  Using an explicit Dockerfile instead of Railway's auto-detected
+  builder so the system-package install is reliable: Railway's default
+  builder has shifted (Nixpacks → Railpack) and Railpack silently
+  ignores `nixpacks.toml`, which is how earlier `ffmpeg` installs were
+  dropped on the floor.
+- **Python deps:** `fastmcp`, `httpx`, `pillow` (`requirements.txt`),
+  installed by the Dockerfile via `pip install -r requirements.txt`.
+  The base image is Python 3.11, comfortably above FastMCP's 3.10+
+  minimum.
 - **System deps:** `ffmpeg` (provides both `ffmpeg` and `ffprobe`),
-  installed by `nixpacks.toml` (`aptPkgs = ['ffmpeg']`). Used by the
+  installed by the Dockerfile via
+  `apt-get install -y --no-install-recommends ffmpeg`. Used by the
   video tools to probe duration and extract frames.
 - **Persistent state:** Railway mounts a volume at `/data`. `server.py`
   uses `/data` if it exists and is writable, otherwise falls back to
