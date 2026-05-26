@@ -189,18 +189,73 @@ def _auto_place(
     return margin, max_y + 20.0
 
 
+def _save_card_image(card_id: int, img: PILImage.Image) -> tuple[str, str]:
+    img = img.convert("RGB")
+    full_path = FILES_DIR / f"{card_id}.jpg"
+    img.save(full_path, format="JPEG", quality=95)
+    thumb = img.copy()
+    thumb.thumbnail((400, 400))
+    thumb_path = THUMBS_DIR / f"{card_id}.jpg"
+    thumb.save(thumb_path, format="JPEG", quality=85)
+    return f"/thumbs/{card_id}.jpg", f"/files/{card_id}.jpg"
+
+
 def _download_and_store(card_id: int, source_url: str) -> tuple[str, str]:
+    """Download source_url and save card thumbnail + full image.
+
+    Detects the kind from the response Content-Type. Images are decoded
+    directly with PIL. Videos are streamed to a temp file (same 500 MB
+    cap as the video tools) and a single mid-clip frame is extracted
+    with ffmpeg, used as both the full image and the thumbnail. The
+    card's source_url is left untouched either way, so get_video_overview
+    and extract_frames can still fetch the original video.
+    """
     try:
-        resp = httpx.get(source_url, timeout=60, follow_redirects=True)
-        resp.raise_for_status()
-        img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
-        full_path = FILES_DIR / f"{card_id}.jpg"
-        img.save(full_path, format="JPEG", quality=95)
-        thumb = img.copy()
-        thumb.thumbnail((400, 400))
-        thumb_path = THUMBS_DIR / f"{card_id}.jpg"
-        thumb.save(thumb_path, format="JPEG", quality=85)
-        return f"/thumbs/{card_id}.jpg", f"/files/{card_id}.jpg"
+        with httpx.stream(
+            "GET", source_url, timeout=300, follow_redirects=True
+        ) as resp:
+            resp.raise_for_status()
+            ctype = (
+                resp.headers.get("content-type") or ""
+            ).lower().split(";")[0].strip()
+            if ctype.startswith("video/"):
+                tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+                tmp.close()
+                tmp_path = tmp.name
+                try:
+                    cl = resp.headers.get("content-length")
+                    try:
+                        if cl and int(cl) > MAX_VIDEO_BYTES:
+                            return "", ""
+                    except ValueError:
+                        pass
+                    written = 0
+                    with open(tmp_path, "wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                            written += len(chunk)
+                            if written > MAX_VIDEO_BYTES:
+                                return "", ""
+                            f.write(chunk)
+                    duration = _ffprobe_duration(tmp_path)
+                    if duration <= 0:
+                        return "", ""
+                    # Pick a representative frame at the midpoint, but pull
+                    # in from the edges so we don't lock onto a black/title
+                    # frame on short clips.
+                    t = max(
+                        0.0,
+                        min(duration * 0.5, max(0.0, duration - 0.5)),
+                    )
+                    frame = _ffmpeg_frame(tmp_path, t)
+                    return _save_card_image(card_id, frame)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            data = resp.read()
+            img = PILImage.open(io.BytesIO(data))
+            return _save_card_image(card_id, img)
     except Exception:
         return "", ""
 
@@ -585,11 +640,14 @@ def add_card(
     """Create a card on the canvas.
 
     kind must be one of: reference, generation, anchor, video, deliverable, note.
-    If source_url is given, the server downloads the image and saves both a
-    thumbnail and a full-resolution copy under /data; the served paths are
-    written to thumbnail_url and full_image_url. If x/y are omitted, the card
-    is auto-placed on a simple grid. Returns JSON with the new card's id and
-    its served image URLs.
+    If source_url is given, the server downloads it and saves a thumbnail and
+    a full-resolution copy under /data; the served paths are written to
+    thumbnail_url and full_image_url. If the URL is a video (detected via
+    Content-Type), one mid-clip frame is extracted with ffmpeg and used as
+    the card's image, while the original video URL is kept on source_url so
+    it can still be inspected with get_video_overview / extract_frames. If
+    x/y are omitted, the card is auto-placed on a simple grid. Returns JSON
+    with the new card's id and its served image URLs.
     """
     if kind not in ALLOWED_KINDS:
         raise ValueError(f"kind must be one of {sorted(ALLOWED_KINDS)}")

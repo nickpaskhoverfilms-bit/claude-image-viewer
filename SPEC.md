@@ -110,8 +110,15 @@ Four tools that read and write the SQLite canvas.
   downloads it via httpx, saves both a full JPEG and a 400px thumbnail
   under `files/{id}.jpg` / `thumbs/{id}.jpg`, and writes the served
   paths (`/files/{id}.jpg`, `/thumbs/{id}.jpg`) into `thumbnail_url`
-  and `full_image_url`. If `x`/`y` are omitted, the card is auto-placed
-  on the next empty grid slot (see Auto-placement).
+  and `full_image_url`. The response `Content-Type` decides how the
+  URL is decoded: anything starting with `video/` is streamed to a
+  temp file under the `MAX_VIDEO_BYTES` (500 MB) cap and one mid-clip
+  frame is extracted with `ffmpeg` to use as the card's image;
+  everything else is decoded directly with PIL. `source_url` itself is
+  left as-is on the card either way, so video cards can still be
+  inspected later with `get_video_overview` / `extract_frames`.
+  If `x`/`y` are omitted, the card is auto-placed on the next empty
+  grid slot (see Auto-placement).
 - **`update_card(card_id, title=None, status=None, prompt=None,
   notes=None, section=None, parent_card_id=None, x=None, y=None) -> str`**
   — partial update. Any argument left at `None` is not changed.
