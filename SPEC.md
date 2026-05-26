@@ -18,6 +18,9 @@ The whole server is a single Python file (`server.py`) running on Railway.
   python server.py`.
 - **Python deps:** `fastmcp`, `httpx`, `pillow` (`requirements.txt`).
   Requires Python 3.10+ (FastMCP requirement).
+- **System deps:** `ffmpeg` (provides both `ffmpeg` and `ffprobe`),
+  installed by `nixpacks.toml` (`aptPkgs = ['ffmpeg']`). Used by the
+  video tools to probe duration and extract frames.
 - **Persistent state:** Railway mounts a volume at `/data`. `server.py`
   uses `/data` if it exists and is writable, otherwise falls back to
   `./data` so the same code works locally. The SQLite database, full-
@@ -39,7 +42,7 @@ The directory `data/` is in `.gitignore`.
 ## The MCP server
 
 FastMCP server named `"Image Viewer"`. HTTP transport, served at
-`/mcp/<MCP_TOKEN>` (see Security). Exposes six tools, in two groups.
+`/mcp/<MCP_TOKEN>` (see Security). Exposes eight tools, in three groups.
 
 ### Image-viewing tools
 
@@ -56,6 +59,42 @@ MCP `Image` payload that Claude renders inline.
 
 Shrinking is done in-process by the `shrink(url, max_edge)` helper
 (`Pillow.thumbnail` + JPEG re-encode at quality 85).
+
+### Video tools
+
+Two tools that stream a video to a temp file, probe it with `ffprobe`,
+and extract frames with `ffmpeg` (fast-seek `-ss` before `-i`,
+re-encoded to MJPEG and piped to stdout). Both reject anything larger
+than `MAX_VIDEO_BYTES` (500 MB) — enforced both by the declared
+`Content-Length` and by a streamed byte cap during download. Only
+direct video URLs (mp4, mov, webm, etc.) are supported; HLS/DASH
+manifests are not. The temp file is always unlinked in a `finally`.
+
+- **`get_video_overview(video_url: str) -> Image`** — returns a single
+  4×3 contact-sheet JPEG with `OVERVIEW_FRAMES` (12) frames sampled
+  evenly across the clip, each labeled with its timestamp in the
+  bottom-left of its tile. Sampling skips a small head/tail margin
+  (`min(0.5s, 5% of duration)`) so it doesn't lock onto title/end
+  cards. Tile size is derived from the first frame's aspect ratio
+  and capped so both sheet dimensions stay within
+  `OVERVIEW_LONG_EDGE` (1280 px). Labels are drawn on a translucent
+  overlay that is alpha-composited over the sheet, so they stay
+  readable on any frame content.
+- **`extract_frames(video_url, start_time, end_time) -> list[Image]`**
+  — returns up to `EXTRACT_MAX_FRAMES` (8) frames sampled evenly
+  across `[start_time, end_time]`, endpoints inclusive. For windows
+  ≤ 8 s the count is `round(window_seconds)`; for longer windows the
+  full 8 frames are used. Each frame is downscaled so its long edge
+  is ≤ `EXTRACT_LONG_EDGE` (1568 px) and gets the same timestamp pill
+  in the bottom-left corner (`_draw_timestamp_label`). Time arguments
+  accept either seconds (`"42"`, `"42.5"`) or colon strings (`"1:23"`
+  = m:ss, `"0:01:23"` = h:mm:ss), parsed by `_parse_time`. `end_time`
+  is clamped to the video's duration; `start_time` past the end or
+  not strictly before `end_time` raises `ValueError`.
+
+Timestamp labels use DejaVu Sans Bold from the Nixpacks-supplied
+Debian font path, falling back to PIL's default font if missing
+(`_load_label_font`).
 
 ### Canvas tools
 
